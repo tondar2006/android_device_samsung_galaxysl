@@ -21,39 +21,26 @@
 *
 */
 
-#define LOG_TAG "****CameraHAL"
+#define LOG_TAG "CameraHAL_Module"
 
-#include <stdio.h>
-#include <stdarg.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <time.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <utils/Log.h>
-#include <videodev2.h>
-#include "binder/MemoryBase.h"
-#include "binder/MemoryHeapBase.h"
-#include <camera/CameraParameters.h>
-#include <hardware/camera.h>
-#include <sys/ioctl.h>
-#include "CameraHardware.h"
-#include <binder/MemoryBase.h>
-#include <binder/MemoryHeapBase.h>
-//#include <utils/threads.h>
-#include "V4L2Camera.h"
-#define LOG_FUNCTION_NAME           ALOGD("%d: %s() ENTER", __LINE__, __FUNCTION__);
+#include <utils/threads.h>
 
-using namespace android;
-static CameraHardware *V4L2CameraHardware;
+#include "CameraHal.h"
+#include "CameraProperties.h"
+#include "TICameraParameters.h"
+
+
+static android::CameraProperties gCameraProperties;
+static android::CameraHal* gCameraHals[MAX_CAMERAS_SUPPORTED];
+static unsigned int gCamerasOpen = 0;
+static android::Mutex gCameraHalDeviceLock;
+
 static int camera_device_open(const hw_module_t* module, const char* name,
                 hw_device_t** device);
 static int camera_device_close(hw_device_t* device);
 static int camera_get_number_of_cameras(void);
 static int camera_get_camera_info(int camera_id, struct camera_info *info);
+
 static struct hw_module_methods_t camera_module_methods = {
         open: camera_device_open
 };
@@ -64,8 +51,8 @@ camera_module_t HAL_MODULE_INFO_SYM = {
          version_major: 1,
          version_minor: 0,
          id: CAMERA_HARDWARE_MODULE_ID,
-         name: "V4L2 CameraHal Module - LATONA",
-         author: "Linaro, Waleed Qadi, Dheeraj CVR",
+         name: "TI OMAP CameraHal Module",
+         author: "TI",
          methods: &camera_module_methods,
          dso: NULL, /* remove compilation warnings */
          reserved: {0}, /* remove compilation warnings */
@@ -74,11 +61,11 @@ camera_module_t HAL_MODULE_INFO_SYM = {
     get_camera_info: camera_get_camera_info,
 };
 
-typedef struct V4L2_camera_device {
+typedef struct ti_camera_device {
     camera_device_t base;
     /* TI specific "private" data can go here (base.priv) */
     int cameraid;
-} V4l2_camera_device_t;
+} ti_camera_device_t;
 
 
 /*******************************************************************
@@ -89,20 +76,18 @@ int camera_set_preview_window(struct camera_device * device,
         struct preview_stream_ops *window)
 {
     int rv = -EINVAL;
-    LOG_FUNCTION_NAME
-         if(!device)
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
         return rv;
 
-    if(window==NULL)
-    {
-        ALOGW("window is NULL");
-        V4L2CameraHardware->setPreviewWindow(window);
-     return -1;
-    }
+    ti_dev = (ti_camera_device_t*) device;
 
-        V4L2CameraHardware->setPreviewWindow(window);
-    ALOGD("Exiting the function");
-    return 0;
+    rv = gCameraHals[ti_dev->cameraid]->setPreviewWindow(window);
+
+    return rv;
 }
 
 void camera_set_callbacks(struct camera_device * device,
@@ -112,162 +97,360 @@ void camera_set_callbacks(struct camera_device * device,
         camera_request_memory get_memory,
         void *user)
 {
-    V4l2_camera_device_t* V4l2_dev = NULL;
-    LOG_FUNCTION_NAME
-    V4L2CameraHardware->setCallbacks(notify_cb,data_cb,data_cb_timestamp,get_memory,user);
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    gCameraHals[ti_dev->cameraid]->setCallbacks(notify_cb, data_cb, data_cb_timestamp, get_memory, user);
 }
 
 void camera_enable_msg_type(struct camera_device * device, int32_t msg_type)
 {
-    V4l2_camera_device_t* V4l2_dev = NULL;
-    V4L2CameraHardware->enableMsgType(msg_type);
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    gCameraHals[ti_dev->cameraid]->enableMsgType(msg_type);
 }
 
 void camera_disable_msg_type(struct camera_device * device, int32_t msg_type)
 {
-    V4l2_camera_device_t* V4l2_dev = NULL;
-    V4L2CameraHardware->disableMsgType(msg_type);
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    gCameraHals[ti_dev->cameraid]->disableMsgType(msg_type);
 }
 
 int camera_msg_type_enabled(struct camera_device * device, int32_t msg_type)
 {
-    V4l2_camera_device_t* V4l2_dev = NULL;
-    return V4L2CameraHardware->msgTypeEnabled(msg_type);
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return 0;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    return gCameraHals[ti_dev->cameraid]->msgTypeEnabled(msg_type);
 }
 
 int camera_start_preview(struct camera_device * device)
 {
-    LOG_FUNCTION_NAME
-    return V4L2CameraHardware->startPreview();
+    int rv = -EINVAL;
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return rv;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    rv = gCameraHals[ti_dev->cameraid]->startPreview();
+
+    return rv;
 }
 
 void camera_stop_preview(struct camera_device * device)
 {
-LOG_FUNCTION_NAME
-V4L2CameraHardware->stopPreview();
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    gCameraHals[ti_dev->cameraid]->stopPreview();
 }
 
 int camera_preview_enabled(struct camera_device * device)
 {
-    LOG_FUNCTION_NAME
-    if(V4L2CameraHardware->previewEnabled())
-    {
-        ALOGW("----Preview Enabled----");
-        return 1;
-    }
-    else
-    {
-        ALOGW("----Preview not Enabled----");
-        return 0;
-    }
+    int rv = -EINVAL;
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return rv;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    rv = gCameraHals[ti_dev->cameraid]->previewEnabled();
+    return rv;
 }
 
 int camera_store_meta_data_in_buffers(struct camera_device * device, int enable)
 {
     int rv = -EINVAL;
-    LOG_FUNCTION_NAME
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return rv;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    //  TODO: meta data buffer not current supported
+    rv = gCameraHals[ti_dev->cameraid]->storeMetaDataInBuffers(enable);
     return rv;
+    //return enable ? android::INVALID_OPERATION: android::OK;
 }
 
 int camera_start_recording(struct camera_device * device)
 {
-LOG_FUNCTION_NAME
-    return V4L2CameraHardware->startRecording();
+    int rv = -EINVAL;
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return rv;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    rv = gCameraHals[ti_dev->cameraid]->startRecording();
+    return rv;
 }
 
 void camera_stop_recording(struct camera_device * device)
 {
-LOG_FUNCTION_NAME
-    V4L2CameraHardware->stopRecording();
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    gCameraHals[ti_dev->cameraid]->stopRecording();
 }
 
 int camera_recording_enabled(struct camera_device * device)
 {
-    LOG_FUNCTION_NAME
-    return V4L2CameraHardware->recordingEnabled();
+    int rv = -EINVAL;
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return rv;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    rv = gCameraHals[ti_dev->cameraid]->recordingEnabled();
+    return rv;
 }
 
 void camera_release_recording_frame(struct camera_device * device,
                 const void *opaque)
 {
-    return V4L2CameraHardware->releaseRecordingFrame(opaque);
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    gCameraHals[ti_dev->cameraid]->releaseRecordingFrame(opaque);
 }
 
 int camera_auto_focus(struct camera_device * device)
 {
-    LOG_FUNCTION_NAME
-    return V4L2CameraHardware->autoFocus();
+    int rv = -EINVAL;
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return rv;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    rv = gCameraHals[ti_dev->cameraid]->autoFocus();
+    return rv;
 }
 
 int camera_cancel_auto_focus(struct camera_device * device)
 {
-LOG_FUNCTION_NAME
-    return V4L2CameraHardware->cancelAutoFocus();
+    int rv = -EINVAL;
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return rv;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    rv = gCameraHals[ti_dev->cameraid]->cancelAutoFocus();
+    return rv;
 }
 
+#ifdef OMAP_ENHANCEMENT_CPCAM
+int camera_take_picture(struct camera_device * device, const char *params)
+#else
 int camera_take_picture(struct camera_device * device)
+#endif
 {
-LOG_FUNCTION_NAME
-    return V4L2CameraHardware->takePicture();
+    int rv = -EINVAL;
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return rv;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    rv = gCameraHals[ti_dev->cameraid]->takePicture();
+    return rv;
 }
 
 int camera_cancel_picture(struct camera_device * device)
 {
-    int rv = 0;// -EINVAL;
-    LOG_FUNCTION_NAME
-    return  V4L2CameraHardware->cancelPicture();
+    int rv = -EINVAL;
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return rv;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    rv = gCameraHals[ti_dev->cameraid]->cancelPicture();
+    return rv;
 }
 
-int camera_set_parameters(struct camera_device * device, const char *params)
+int camera_set_parameters(struct camera_device * device, const char *parameters)
 {
-    LOG_FUNCTION_NAME
-    CameraParameters *camParams = new CameraParameters();
-    String8 *params_str8 = new String8(params);
-    camParams->unflatten(*params_str8);
-    return  V4L2CameraHardware->setParameters(*camParams);
+ALOGE("Madhu - CameraHal_Module :: camera_set_parameters");
+    int rv = -EINVAL;
+    ti_camera_device_t* ti_dev = NULL;
+
+    android::CameraParameters params;
+
+    android::String8 str_params(parameters);
+    params.unflatten(str_params);
+
+   
+    ALOGV("%s", __FUNCTION__);
+
+    if(!device)
+        return rv;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    rv = gCameraHals[ti_dev->cameraid]->setParameters(params);
+    return rv;
 }
 
 char* camera_get_parameters(struct camera_device * device)
 {
-    char* param = NULL ;
-    String8 params_str8 = V4L2CameraHardware->getParameters().flatten();
+    ALOGE("Madhu - CameraHal_Module :: camera_get_parameters");
+    android::CameraParameters params;
+    android::String8 params_str8;
+    char* params_string;
+
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGV("%s", __FUNCTION__);
+
+    if(!device)
+        return NULL;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    params = gCameraHals[ti_dev->cameraid]->getParameters();
+
+    params_str8 = params.flatten();
 
     // camera service frees this string...
-    param = (char*) malloc(sizeof(char) * (params_str8.length()+1));
-    strcpy(param, params_str8.string());
-    ALOGV("%s",param);
-    LOG_FUNCTION_NAME
-    return param;
+    params_string = (char*) malloc(sizeof(char) * (params_str8.length()+1));
+    strcpy(params_string, params_str8.string());
+
+    return params_string;
 }
 
-static void camera_put_parameters(struct camera_device *device, char *params)
+static void camera_put_parameters(struct camera_device *device, char *parms)
 {
-    LOG_FUNCTION_NAME
-    CameraParameters *camParams = new CameraParameters();
-    String8 *params_str8 = new String8(params);
-    camParams->unflatten(*params_str8);
-    V4L2CameraHardware->setParameters(*camParams);
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    gCameraHals[ti_dev->cameraid]->putParameters(parms);
 }
 
 int camera_send_command(struct camera_device * device,
             int32_t cmd, int32_t arg1, int32_t arg2)
 {
-    int rv =0;// -EINVAL;
-    LOG_FUNCTION_NAME
+    int rv = -EINVAL;
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return rv;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    rv = gCameraHals[ti_dev->cameraid]->sendCommand(cmd, arg1, arg2);
     return rv;
 }
 
 void camera_release(struct camera_device * device)
 {
-    LOG_FUNCTION_NAME
-    V4L2CameraHardware->release();
-}
+    ti_camera_device_t* ti_dev = NULL;
 
+    ALOGE("%s", __FUNCTION__);
+
+    if(!device)
+        return;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    gCameraHals[ti_dev->cameraid]->release();
+}
 
 int camera_dump(struct camera_device * device, int fd)
 {
-    int rv = 0;//-EINVAL;
-    LOG_FUNCTION_NAME
+    int rv = -EINVAL;
+    ti_camera_device_t* ti_dev = NULL;
+
+    if(!device)
+        return rv;
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    rv = gCameraHals[ti_dev->cameraid]->dump(fd);
     return rv;
 }
 
@@ -276,9 +459,35 @@ extern "C" void heaptracker_free_leaked_memory(void);
 int camera_device_close(hw_device_t* device)
 {
     int ret = 0;
-    LOG_FUNCTION_NAME
-    delete V4L2CameraHardware;
-    V4L2CameraHardware=NULL;
+    ti_camera_device_t* ti_dev = NULL;
+
+    ALOGE("%s", __FUNCTION__);
+
+    android::Mutex::Autolock lock(gCameraHalDeviceLock);
+
+    if (!device) {
+        ret = -EINVAL;
+        goto done;
+    }
+
+    ti_dev = (ti_camera_device_t*) device;
+
+    if (ti_dev) {
+        if (gCameraHals[ti_dev->cameraid]) {
+            delete gCameraHals[ti_dev->cameraid];
+            gCameraHals[ti_dev->cameraid] = NULL;
+            gCamerasOpen--;
+        }
+
+        if (ti_dev->base.ops) {
+            free(ti_dev->base.ops);
+        }
+        free(ti_dev);
+    }
+done:
+#ifdef HEAPTRACKER
+    heaptracker_free_leaked_memory();
+#endif
     return ret;
 }
 
@@ -296,16 +505,20 @@ int camera_device_open(const hw_module_t* module, const char* name,
                 hw_device_t** device)
 {
     int rv = 0;
-    int num_cameras = 2;
+    int num_cameras = 0;
     int cameraid;
-    V4l2_camera_device_t* camera_device = NULL;
+    ti_camera_device_t* camera_device = NULL;
     camera_device_ops_t* camera_ops = NULL;
+    android::CameraHal* camera = NULL;
+    android::CameraProperties::Properties* properties = NULL;
 
-    LOG_FUNCTION_NAME
-    ALOGI("camera_device open");
+    android::Mutex::Autolock lock(gCameraHalDeviceLock);
+
+    ALOGE("camera_device open");
 
     if (name != NULL) {
         cameraid = atoi(name);
+        num_cameras = gCameraProperties.camerasSupported();
 
         if(cameraid > num_cameras)
         {
@@ -316,8 +529,14 @@ int camera_device_open(const hw_module_t* module, const char* name,
             goto fail;
         }
 
+        if(gCamerasOpen >= MAX_SIMUL_CAMERAS_SUPPORTED)
+        {
+            ALOGE("maximum number of cameras already open");
+            rv = -ENOMEM;
+            goto fail;
+        }
 
-        camera_device = (V4l2_camera_device_t*)malloc(sizeof(*camera_device));
+        camera_device = (ti_camera_device_t*)malloc(sizeof(*camera_device));
         if(!camera_device)
         {
             ALOGE("camera_device allocation fail");
@@ -371,7 +590,32 @@ int camera_device_open(const hw_module_t* module, const char* name,
         // -------- TI specific stuff --------
 
         camera_device->cameraid = cameraid;
-        V4L2CameraHardware = new CameraHardware(cameraid);
+
+        if(gCameraProperties.getProperties(cameraid, &properties) < 0)
+        {
+            ALOGE("Couldn't get camera properties");
+            rv = -ENOMEM;
+            goto fail;
+        }
+
+        camera = new android::CameraHal(cameraid);
+
+        if(!camera)
+        {
+            ALOGE("Couldn't create instance of CameraHal class");
+            rv = -ENOMEM;
+            goto fail;
+        }
+
+        if(properties && (camera->initialize(properties) != android::NO_ERROR))
+        {
+            ALOGE("Couldn't initialize camera instance");
+            rv = -ENODEV;
+            goto fail;
+        }
+
+        gCameraHals[cameraid] = camera;
+        gCamerasOpen++;
     }
 
     return rv;
@@ -385,33 +629,89 @@ fail:
         free(camera_ops);
         camera_ops = NULL;
     }
+    if(camera) {
+        delete camera;
+        camera = NULL;
+    }
     *device = NULL;
     return rv;
 }
 
 int camera_get_number_of_cameras(void)
 {
-    LOG_FUNCTION_NAME
-    int num_cameras =2;// MAX_CAMERAS_SUPPORTED;
+    int num_cameras = MAX_CAMERAS_SUPPORTED;
+
+    // TODO(XXX): Ducati is not loaded yet when camera service gets here
+    //  Lets revisit this later to see if we can somehow get this working
+#if 0
+    // this going to be the first call from camera service
+    // initialize camera properties here...
+    if(gCameraProperties.initialize() != android::NO_ERROR)
+    {
+        CAMHAL_LOGEA("Unable to create or initialize CameraProperties");
+        return NULL;
+    }
+
+    num_cameras = gCameraProperties.camerasSupported();
+#endif
+
     return num_cameras;
 }
 
 int camera_get_camera_info(int camera_id, struct camera_info *info)
 {
-    LOG_FUNCTION_NAME
     int rv = 0;
-    int face_value = CAMERA_FACING_FRONT;
+    int face_value = CAMERA_FACING_BACK;
+    int orientation = 90;
     const char *valstr = NULL;
-    if(camera_id == 0) {
-    info->facing = CAMERA_FACING_BACK;
-    info->orientation = 90;
-    ALOGD("cameraHal BACK %d",camera_id);
+    android::CameraProperties::Properties* properties = NULL;
+
+    // this going to be the first call from camera service
+    // initialize camera properties here...
+    if(gCameraProperties.initialize() != android::NO_ERROR)
+    {
+        CAMHAL_LOGEA("Unable to create or initialize CameraProperties");
+        return NULL;
     }
-    else {
-    ALOGD("cameraHal Front %d",camera_id);
+
+    //Get camera properties for camera index
+    if(gCameraProperties.getProperties(camera_id, &properties) < 0)
+    {
+        ALOGE("Couldn't get camera properties");
+        rv = -EINVAL;
+        goto end;
+    }
+
+    if(properties)
+    {
+        valstr = properties->get(android::CameraProperties::FACING_INDEX);
+        if(valstr != NULL)
+        {
+            if (strcmp(valstr, (const char *) android::TICameraParameters::FACING_FRONT) == 0)
+            {
+                face_value = CAMERA_FACING_FRONT;
+                orientation = 270;
+            }
+            else if (strcmp(valstr, (const char *) android::TICameraParameters::FACING_BACK) == 0)
+            {
+                face_value = CAMERA_FACING_BACK;
+                orientation = 90;
+            }
+         }
+    }
+    else
+    {
+        CAMHAL_LOGEB("getProperties() returned a NULL property set for Camera id %d", camera_id);
+    }
+
     info->facing = face_value;
-    info->orientation = 270;
-    }
-    ALOGD("cameraHal %d",camera_id);
+    info->orientation = orientation;
+
+end:
     return rv;
 }
+
+
+
+
+

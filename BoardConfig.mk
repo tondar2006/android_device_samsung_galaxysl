@@ -21,7 +21,7 @@ TARGET_thumb_CFLAGS := -mthumb \
                         -fomit-frame-pointer \
                         -fstrict-aliasing
 
-COMMON_GLOBAL_CFLAGS += -DOMAP_ENHANCEMENT -DTARGET_OMAP3
+COMMON_GLOBAL_CFLAGS += -DOMAP_ENHANCEMENT -DTARGET_OMAP3 -DOMAP_ICS_CAMERA
 
 TARGET_BOOTANIMATION_PRELOAD := true
 TARGET_BOOTANIMATION_TEXTURE_CACHE := true
